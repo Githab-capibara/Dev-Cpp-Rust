@@ -1,0 +1,26 @@
+[package]
+repository = "https://github.com/Githab-capibara/Dev-Cpp-Rust"
+keywords = ["ide", "c", "cpp", "gtk4", "dev-cpp"]
+categories = ["development-tools"]
+name = "devcpp-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Command line front-end of the devcpp IDE: build, run, debug and inspect projects without a GUI."
+
+[[bin]]
+name = "devcpp"
+path = "src/main.rs"
+
+[dependencies]
+devcpp-core = { path = "../devcpp-core", version = "1.0.0" }
+anyhow.workspace = true
+clap = { version = "4", features = ["derive"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

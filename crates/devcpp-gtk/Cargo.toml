@@ -1,0 +1,29 @@
+[package]
+repository = "https://github.com/Githab-capibara/Dev-Cpp-Rust"
+keywords = ["ide", "c", "cpp", "gtk4", "dev-cpp"]
+categories = ["development-tools"]
+name = "devcpp-gtk"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "GTK4 front-end of the devcpp IDE."
+
+[[bin]]
+name = "devcpp-gtk"
+path = "src/main.rs"
+
+[dependencies]
+devcpp-core = { path = "../devcpp-core", version = "1.0.0" }
+anyhow.workspace = true
+gtk = { package = "gtk4", version = "0.11", features = ["v4_12"] }
+sourceview = { package = "sourceview5", version = "0.11", features = ["v5_10"] }
+glib = "0.22"
+gio = "0.22"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

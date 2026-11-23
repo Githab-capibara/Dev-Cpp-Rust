@@ -1,0 +1,17 @@
+# Build artifacts
+/target
+**/*.rs.bk
+
+# Local editor / OS files
+*.swp
+.DS_Store
+
+# Screenshots captured during GUI verification
+/*.png
+
+# The original Dev-C++ sources are the GPL-licensed upstream reference.
+# They are deliberately not committed; see docs/adr/07-reference-sources.md.
+/reference/
+
+# Local scratch files
+err_now.txt
