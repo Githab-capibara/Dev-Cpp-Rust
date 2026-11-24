@@ -17,3 +17,5 @@
 | [08. Compile & Run: вывод программы через тот же пайплайн](08-build-and-run-streaming.md) | `RunMode::BuildAndRun` исполняется внутри build-джоба | Accepted |
 | [09. Комплишн: поповер GTK4 поверх headless-движка](09-completion-popover.md) | Живой индекс символов + `Ctrl+Space`/авто-`.`/`->` | Accepted |
 | [10. Лицензия: MIT OR Apache-2.0](10-licensing-mit-apache.md) | Двойная лицензия, оба текста в дереве | Accepted |
+| [11. Undo/Redo — snapshot'ы буфера](11-undo-redo-snapshot-stack.md) | GtkSourceView 5 без публичного undo API; батчи по `buffer.changed` | Accepted |
+| [12. Find/Replace — бар и `SearchContext`](12-find-replace-bar.md) | Немодальный поиск/замена на стороне GtkSourceView | Accepted |
