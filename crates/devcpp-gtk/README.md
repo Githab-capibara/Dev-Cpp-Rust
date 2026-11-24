@@ -6,8 +6,8 @@ GTK4-фронтенд IDE: нативный интерфейс, повторяю
 
 | Модуль | Что делает |
 |--------|------------|
-| [`app.rs`](src/app.rs) | Главное окно: меню (File/Edit/Build/Debug/Tools/Help), тулбар, шорткаты, мастер New Project, Save As, контекстное меню редактора, поллинг build/отладки |
-| [`editor.rs`](src/editor.rs) | Вкладка редактора на GtkSourceView 5: файл на диске, автоподсветка языка, комплишн-поповер (`.`/`->` авто, `Ctrl+Space`, Tab/Enter — вставка, Escape — закрытие) |
+| [`app.rs`](src/app.rs) | Главное окно: меню (File/Edit/Build/Debug/Tools/Help) с мнемониками `Alt+<буква>`, тулбар, акселераторы через `set_accels_for_action`, мастер New Project (Enter = создать, Escape = закрыть), Save/Save As (безымянная вкладка уходит в Save As), контекстное меню редактора, открытие проекта/файла из argv, поллинг build/отладки |
+| [`editor.rs`](src/editor.rs) | Вкладка редактора на GtkSourceView 5: файл на диске, автоподсветка языка, комплишн-поповер (`.`/`->` авто, `Ctrl+Space`, Tab/Enter — вставка, Escape — закрытие), **свои undo/redo** (snapshot'ы буфера, батч по `buffer.changed`), **Find/Replace-бар** (`sourceview::SearchContext`) |
 | [`panels.rs`](src/panels.rs) | Дерево проекта, класс-браузер, Compiler Output (диагностики помнят строку лога — клик переводит к ошибке), Debug-панель (стек, переменные, брейкпоинты, консоль) |
 
 ## Компоновка окна
@@ -29,8 +29,14 @@ GTK4-фронтенд IDE: нативный интерфейс, повторяю
 
 ```bash
 cargo build --release -p devcpp-gtk
-./target/release/devcpp-gtk
+./target/release/devcpp-gtk                 # пустое окно + стартовая вкладка
+./target/release/devcpp-gtk hello.dev       # сразу открыть проект и его юниты
+./target/release/devcpp-gtk main.cpp        # открыть файл во вкладке
 ```
+
+Окно открывается maximized; стартовая untitled-вкладка берёт фокус, чтобы
+набор никогда не попадал на кнопки тулбара, и закрывается сама, как только
+открывается проект (пустая и немодифицированная).
 
 Зависит от системных библиотек: `gtk4`, `gtksourceview-5`, `gcc`/`g++`
 (сборка), `gdb` (отладка), `make`.

@@ -43,11 +43,71 @@ struct AppState {
 pub fn run() -> anyhow::Result<()> {
     let app = gtk::Application::builder()
         .application_id("org.devcpp.ide")
+        // Accept "devcpp-gtk file.dev" and "devcpp-gtk main.cpp", like
+        // Dev-C++ when a project or unit is associated with the IDE.
+        .flags(gio::ApplicationFlags::HANDLES_OPEN)
         .build();
 
     app.connect_activate(build_ui);
+    app.connect_open(open_files_from_launch);
     app.run();
     Ok(())
+}
+
+/// The UI of a running window plus its shared state.
+type LiveUi = (Rc<Ui>, Rc<RefCell<AppState>>);
+
+thread_local! {
+    /// The live UI of the running window, set when it is built. File
+    /// arguments are handled by the `open` signal, which fires after
+    /// `activate`, so the window already exists here.
+    static LIVE_UI: RefCell<Option<LiveUi>> = const { RefCell::new(None) };
+}
+
+/// Builds the UI for files passed on the command line.
+fn open_files_from_launch(app: &gtk::Application, files: &[gio::File], _hint: &str) {
+    if app.active_window().is_none() {
+        build_ui(app);
+    }
+    LIVE_UI.with(|slot| {
+        let Some((ui, state)) = slot
+            .borrow()
+            .as_ref()
+            .map(|(u, s)| (Rc::clone(u), Rc::clone(s)))
+        else {
+            return;
+        };
+        for file in files {
+            let Some(path) = file.path() else {
+                continue;
+            };
+            open_launch_target(&ui, &state, &path);
+        }
+    });
+}
+
+/// Opens a launch argument: `.dev` loads the project (and its units), any
+/// other file opens as a source tab.
+fn open_launch_target(ui: &Rc<Ui>, state: &Rc<RefCell<AppState>>, path: &Path) {
+    if path
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("dev"))
+    {
+        match Project::load(path) {
+            Ok(project) => {
+                ui.project_panel.set_project(&project);
+                let symbol_index = index_for(&project);
+                ui.class_panel.set_index(&symbol_index);
+                *state.borrow_mut().index.borrow_mut() = symbol_index;
+                state.borrow_mut().project = Some(project);
+                panels::set_status(&ui.statusbar, "Project opened");
+                open_project_sources(ui, state);
+            }
+            Err(e) => panels::show_error(&ui.window, "Cannot open project", &e.to_string()),
+        }
+    } else {
+        open_file(ui, state, path);
+    }
 }
 
 fn build_ui(app: &gtk::Application) {
@@ -69,6 +129,8 @@ fn build_ui(app: &gtk::Application) {
         .title("devcpp — Dev-C++ for Linux")
         .default_width(1200)
         .default_height(760)
+        // An IDE opens maximized, like Dev-C++ on Windows.
+        .maximized(true)
         .build();
 
     let notebook = gtk::Notebook::builder().hexpand(true).vexpand(true).build();
@@ -113,7 +175,15 @@ fn build_ui(app: &gtk::Application) {
         .build();
     main_paned.set_start_child(Some(&paned));
     main_paned.set_end_child(Some(&bottom_notebook));
-    main_paned.set_position(480);
+    // A fixed pixel position collapses the output panel on small windows, so
+    // the split is derived from the real height once it is known.
+    let paned_for_layout = main_paned.clone();
+    glib::idle_add_local_once(move || {
+        let height = paned_for_layout.height();
+        if height > 120 {
+            paned_for_layout.set_position(((height as f32) * 0.72) as i32);
+        }
+    });
 
     let statusbar = gtk::Label::new(Some("Ready"));
     statusbar.set_xalign(0.0);
@@ -138,13 +208,46 @@ fn build_ui(app: &gtk::Application) {
         statusbar,
     });
 
-    install_actions(&ui, &state);
+    install_actions(app, &ui, &state);
     install_menu(&ui, &state);
-    install_shortcuts(&ui, &state);
+    install_mouse_gestures(&ui, &state);
     install_project_tree(&ui, &state);
 
     panels::set_status(&ui.statusbar, "Ready");
+    // Start with one editor tab focused, like any editor-first IDE: typing
+    // must never land on a toolbar button.
+    open_new_editor(&ui, &state);
+    install_window_keys(&ui, &state);
+    // Quitting must not leave the UI slot dangling: it holds the only strong
+    // references outside the window tree.
+    ui.window.connect_close_request(|_| {
+        LIVE_UI.with(|slot| *slot.borrow_mut() = None);
+        glib::Propagation::Proceed
+    });
+    LIVE_UI.with(|slot| {
+        *slot.borrow_mut() = Some((Rc::clone(&ui), Rc::clone(&state)));
+    });
     ui.window.present();
+}
+
+/// Window-level keys: Escape closes an open find/replace bar first.
+fn install_window_keys(ui: &Rc<Ui>, state: &Rc<RefCell<AppState>>) {
+    let keys = gtk::EventControllerKey::new();
+    let ui_keys = Rc::clone(ui);
+    let state_keys = state.clone();
+    keys.connect_key_pressed(move |_, keyval, _, _| {
+        if keyval == gdk::Key::Escape {
+            if let Some(editor) = current_editor(&ui_keys, &state_keys) {
+                if editor.find_bar_visible() {
+                    editor.hide_find();
+                    editor.view.grab_focus();
+                    return gtk::glib::Propagation::Stop;
+                }
+            }
+        }
+        gtk::glib::Propagation::Proceed
+    });
+    ui.window.add_controller(keys);
 }
 
 /// The widgets the actions operate on.
@@ -158,60 +261,32 @@ struct Ui {
     statusbar: gtk::Label,
 }
 
-fn install_actions(ui: &Rc<Ui>, state: &Rc<RefCell<AppState>>) {
-    let shortcuts: &[(&str, gdk::Key, gdk::ModifierType)] = &[
-        ("win.build", gdk::Key::F9, gdk::ModifierType::CONTROL_MASK),
-        ("win.run", gdk::Key::F10, gdk::ModifierType::CONTROL_MASK),
-        ("win.debug", gdk::Key::F8, gdk::ModifierType::CONTROL_MASK),
-        ("win.new-file", gdk::Key::n, gdk::ModifierType::CONTROL_MASK),
-        ("win.open", gdk::Key::o, gdk::ModifierType::CONTROL_MASK),
-        ("win.save", gdk::Key::s, gdk::ModifierType::CONTROL_MASK),
-        (
-            "win.save-as",
-            gdk::Key::s,
-            gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::SHIFT_MASK,
-        ),
-        ("win.quit", gdk::Key::q, gdk::ModifierType::CONTROL_MASK),
-        (
-            "win.complete",
-            gdk::Key::space,
-            gdk::ModifierType::CONTROL_MASK,
-        ),
-        (
-            "win.toggle-breakpoint",
-            gdk::Key::F2,
-            gdk::ModifierType::empty(),
-        ),
-    ];
+/// Global accelerators, in GTK4 `<Control>f9` syntax.
+const ACCELERATORS: &[(&str, &str)] = &[
+    ("build", "<Control>F9"),
+    ("run", "<Control>F10"),
+    ("debug", "<Control>F8"),
+    ("new-file", "<Control>n"),
+    ("open", "<Control>o"),
+    ("save", "<Control>s"),
+    ("save-as", "<Shift><Control>s"),
+    ("quit", "<Control>q"),
+    ("complete", "<Control>space"),
+    ("toggle-breakpoint", "F2"),
+    ("find", "<Control>f"),
+    ("replace", "<Control>h"),
+    ("cut", "<Control>x"),
+    ("copy", "<Control>c"),
+    ("paste", "<Control>v"),
+    ("select-all", "<Control>a"),
+];
 
-    for (action, key, modifiers) in shortcuts {
-        // GTK4 accelerator syntax: "<Control>F9", "<Shift><Control>s".
-        let mut accelerator = String::new();
-        if modifiers.contains(gdk::ModifierType::CONTROL_MASK) {
-            accelerator.push_str("<Control>");
-        }
-        if modifiers.contains(gdk::ModifierType::SHIFT_MASK) {
-            accelerator.push_str("<Shift>");
-        }
-        accelerator.push_str(&format!("<{key}>"));
-        let Some(trigger) = gtk::ShortcutTrigger::parse_string(&accelerator) else {
-            continue;
-        };
-        let action_name = (*action).to_string();
-        let controller = gtk::ShortcutController::new();
-        let shortcut_controller = controller.clone();
-        let callback = gtk::CallbackAction::new(move |_, _| {
-            if let Some(window) = shortcut_controller
-                .widget()
-                .and_then(|w| w.downcast::<gtk::Window>().ok())
-            {
-                let _ = window.activate_action(action_name.as_str(), None);
-            }
-            glib::Propagation::Proceed
-        });
-        let shortcut = gtk::Shortcut::new(Some(trigger), Some(callback));
-        controller.add_shortcut(shortcut);
-        ui.window.add_controller(controller);
+fn install_actions(app: &gtk::Application, ui: &Rc<Ui>, state: &Rc<RefCell<AppState>>) {
+    // Accelerators are registered on the application, which routes "win."
+    // actions to the active window. This replaces per-key shortcut
+    // controllers and is the standard GTK4 mechanism.
+    for (action, accelerator) in ACCELERATORS {
+        app.set_accels_for_action(&format!("win.{action}"), &[accelerator]);
     }
 
     let group = gio::SimpleActionGroup::new();
@@ -299,6 +374,101 @@ fn install_actions(ui: &Rc<Ui>, state: &Rc<RefCell<AppState>>) {
         Box::new(move || toggle_breakpoint(&ui_break, &state_break)),
     );
 
+    let ui_find = ui.clone();
+    let state_find = state.clone();
+    add(
+        "find",
+        Box::new(move || {
+            if let Some(editor) = current_editor(&ui_find, &state_find) {
+                editor.show_find(false);
+            }
+        }),
+    );
+
+    let ui_replace = ui.clone();
+    let state_replace = state.clone();
+    add(
+        "replace",
+        Box::new(move || {
+            if let Some(editor) = current_editor(&ui_replace, &state_replace) {
+                editor.show_find(true);
+            }
+        }),
+    );
+
+    let ui_cut = ui.clone();
+    let state_cut = state.clone();
+    add(
+        "cut",
+        Box::new(move || {
+            if let Some(editor) = current_editor(&ui_cut, &state_cut) {
+                editor.snapshot_undo();
+                let clipboard = editor.view.clipboard();
+                editor.buffer.cut_clipboard(&clipboard, true);
+            }
+        }),
+    );
+
+    let ui_copy = ui.clone();
+    let state_copy = state.clone();
+    add(
+        "copy",
+        Box::new(move || {
+            if let Some(editor) = current_editor(&ui_copy, &state_copy) {
+                let clipboard = editor.view.clipboard();
+                editor.buffer.copy_clipboard(&clipboard);
+            }
+        }),
+    );
+
+    let ui_paste = ui.clone();
+    let state_paste = state.clone();
+    add(
+        "paste",
+        Box::new(move || {
+            if let Some(editor) = current_editor(&ui_paste, &state_paste) {
+                editor.snapshot_undo();
+                let clipboard = editor.view.clipboard();
+                editor.buffer.paste_clipboard(&clipboard, None, true);
+            }
+        }),
+    );
+
+    let ui_select = ui.clone();
+    let state_select = state.clone();
+    add(
+        "select-all",
+        Box::new(move || {
+            if let Some(editor) = current_editor(&ui_select, &state_select) {
+                let start = editor.buffer.start_iter();
+                let end = editor.buffer.end_iter();
+                editor.buffer.select_range(&start, &end);
+            }
+        }),
+    );
+
+    let ui_undo = ui.clone();
+    let state_undo = state.clone();
+    add(
+        "undo",
+        Box::new(move || {
+            if let Some(editor) = current_editor(&ui_undo, &state_undo) {
+                editor.undo();
+            }
+        }),
+    );
+
+    let ui_redo = ui.clone();
+    let state_redo = state.clone();
+    add(
+        "redo",
+        Box::new(move || {
+            if let Some(editor) = current_editor(&ui_redo, &state_redo) {
+                editor.redo();
+            }
+        }),
+    );
+
     let ui_about = ui.clone();
     add(
         "about",
@@ -382,13 +552,23 @@ fn install_menu(ui: &Rc<Ui>, state: &Rc<RefCell<AppState>>) {
     file_menu.append(Some("Save _As…"), Some("win.save-as"));
     file_menu.append_item(&gio::MenuItem::new(None, Some("separator")));
     file_menu.append(Some("_Quit"), Some("win.quit"));
-    menu.append_submenu(Some("File"), &file_menu);
+    menu.append_submenu(Some("_File"), &file_menu);
 
     let edit_menu = gio::Menu::new();
-    edit_menu.append(Some("Complete _Code"), Some("win.complete"));
+    edit_menu.append(Some("_Undo"), Some("win.undo"));
+    edit_menu.append(Some("_Redo"), Some("win.redo"));
     edit_menu.append_item(&gio::MenuItem::new(None, Some("separator")));
+    edit_menu.append(Some("Cu_t"), Some("win.cut"));
+    edit_menu.append(Some("_Copy"), Some("win.copy"));
+    edit_menu.append(Some("_Paste"), Some("win.paste"));
+    edit_menu.append(Some("Select _All"), Some("win.select-all"));
+    edit_menu.append_item(&gio::MenuItem::new(None, Some("separator")));
+    edit_menu.append(Some("_Find…"), Some("win.find"));
+    edit_menu.append(Some("_Replace…"), Some("win.replace"));
+    edit_menu.append_item(&gio::MenuItem::new(None, Some("separator")));
+    edit_menu.append(Some("Complete _Code"), Some("win.complete"));
     edit_menu.append(Some("Toggle _Breakpoint"), Some("win.toggle-breakpoint"));
-    menu.append_submenu(Some("Edit"), &edit_menu);
+    menu.append_submenu(Some("_Edit"), &edit_menu);
 
     let build_menu = gio::Menu::new();
     build_menu.append(Some("_Compile"), Some("win.build"));
@@ -396,22 +576,22 @@ fn install_menu(ui: &Rc<Ui>, state: &Rc<RefCell<AppState>>) {
     build_menu.append(Some("Jump to _Error"), Some("win.goto-error"));
     build_menu.append_item(&gio::MenuItem::new(None, Some("separator")));
     build_menu.append(Some("_Debug"), Some("win.debug"));
-    menu.append_submenu(Some("Build"), &build_menu);
+    menu.append_submenu(Some("_Build"), &build_menu);
 
     let debug_menu = gio::Menu::new();
     debug_menu.append(Some("_Run"), Some("win.debug-run"));
     debug_menu.append(Some("_Continue"), Some("win.debug-continue"));
     debug_menu.append(Some("_Step"), Some("win.debug-step"));
     debug_menu.append(Some("Ne_xt"), Some("win.debug-next"));
-    menu.append_submenu(Some("Debug"), &debug_menu);
+    menu.append_submenu(Some("De_bug"), &debug_menu);
 
     let tools_menu = gio::Menu::new();
     tools_menu.append(Some("_Toolchain…"), Some("win.tools"));
-    menu.append_submenu(Some("Tools"), &tools_menu);
+    menu.append_submenu(Some("_Tools"), &tools_menu);
 
     let help_menu = gio::Menu::new();
     help_menu.append(Some("_About"), Some("win.about"));
-    menu.append_submenu(Some("Help"), &help_menu);
+    menu.append_submenu(Some("_Help"), &help_menu);
 
     // GTK4 has no menu model on windows: the menu bar lives in the header bar.
     let menu_bar = gtk::PopoverMenuBar::from_model(Some(&menu));
@@ -477,7 +657,7 @@ fn install_project_tree(ui: &Rc<Ui>, state: &Rc<RefCell<AppState>>) {
         });
 }
 
-fn install_shortcuts(ui: &Rc<Ui>, state: &Rc<RefCell<AppState>>) {
+fn install_mouse_gestures(ui: &Rc<Ui>, state: &Rc<RefCell<AppState>>) {
     // Compiler output: click a diagnostic to jump to it, like Dev-C++.
     let ui_output = Rc::clone(ui);
     let state_output = Rc::clone(state);
@@ -515,13 +695,26 @@ fn current_editor(ui: &Rc<Ui>, state: &Rc<RefCell<AppState>>) -> Option<Rc<Edito
 /// Opens `path` in the editor, reusing an already open tab.
 fn open_file(ui: &Rc<Ui>, state: &Rc<RefCell<AppState>>, path: &Path) {
     let index = Rc::clone(&state.borrow().index);
-    let editor = Rc::new(Editor::new(path, index));
+    let editor = Editor::new(path, index);
     editor.apply_language();
     let (family, size) = {
         let cfg = &state.borrow().config;
         (cfg.editor.font_family.clone(), cfg.editor.font_size)
     };
     editor.apply_font(&family, size);
+    // A file already open in another tab is focused instead of duplicated.
+    let existing = {
+        let app_state = state.borrow();
+        app_state
+            .editors
+            .iter()
+            .position(|e| *e.path.borrow() == path)
+    };
+    if let Some(index) = existing {
+        ui.notebook.set_current_page(Some(index as u32));
+        state.borrow().editors[index].view.grab_focus();
+        return;
+    }
     let title = path
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
@@ -531,6 +724,35 @@ fn open_file(ui: &Rc<Ui>, state: &Rc<RefCell<AppState>>, path: &Path) {
         .append_page(&editor.widget, Some(&gtk::Label::new(Some(&title))));
     ui.notebook.set_current_page(Some(page));
     state.borrow_mut().editors.push(editor);
+    if let Some(editor) = current_editor(ui, state) {
+        editor.view.grab_focus();
+    }
+}
+
+/// Opens a new in-memory editor tab, like Dev-C++'s "New Source" before the
+/// first save. The path is empty until Save As picks one.
+fn open_new_editor(ui: &Rc<Ui>, state: &Rc<RefCell<AppState>>) {
+    let index = Rc::clone(&state.borrow().index);
+    let editor = Editor::new(Path::new(""), index);
+    let (family, size) = {
+        let cfg = &state.borrow().config;
+        (cfg.editor.font_family.clone(), cfg.editor.font_size)
+    };
+    editor.apply_font(&family, size);
+    let page = ui
+        .notebook
+        .append_page(&editor.widget, Some(&gtk::Label::new(Some("untitled"))));
+    ui.notebook.set_current_page(Some(page));
+    state.borrow_mut().editors.push(editor);
+    editor_focus(ui, state);
+}
+
+/// Moves keyboard focus into the current editor, so toolbar buttons never
+/// swallow typing (e.g. Space activating a button).
+fn editor_focus(ui: &Rc<Ui>, state: &Rc<RefCell<AppState>>) {
+    if let Some(editor) = current_editor(ui, state) {
+        editor.view.grab_focus();
+    }
 }
 
 fn jump_to_diagnostic(
@@ -815,8 +1037,14 @@ fn show_new_project_wizard(ui: &Rc<Ui>, state: &Rc<RefCell<AppState>>) {
 
     // Target folder: an entry filled by a native folder chooser.
     grid.append(&gtk::Label::new(Some("Location")));
+    // Prefilled with ~/projects: the folder Dev-C++ suggests for new work, so
+    // "Create" works with the first keystroke instead of an empty-field error.
+    let default_location = std::env::var("HOME")
+        .map(|home| Path::new(&home).join("projects"))
+        .unwrap_or_else(|_| PathBuf::from("projects"));
     let folder_entry = gtk::Entry::builder()
-        .placeholder_text("/home/you/projects")
+        .placeholder_text("~/projects")
+        .text(default_location.display().to_string())
         .build();
     grid.append(&folder_entry);
     let folder_row = gtk::Box::builder()
@@ -847,6 +1075,19 @@ fn show_new_project_wizard(ui: &Rc<Ui>, state: &Rc<RefCell<AppState>>) {
     content.append(&grid);
     dialog.set_child(Some(&content));
 
+    // Escape closes the wizard, like any dialog.
+    let dialog_escape = dialog.clone();
+    let escape = gtk::EventControllerKey::new();
+    escape.connect_key_pressed(move |_, keyval, _, _| {
+        if keyval == gdk::Key::Escape {
+            dialog_escape.close();
+            gtk::glib::Propagation::Stop
+        } else {
+            gtk::glib::Propagation::Proceed
+        }
+    });
+    dialog.add_controller(escape);
+
     let dialog_cancel = dialog.clone();
     cancel.connect_clicked(move |_| dialog_cancel.close());
     let dialog_create = dialog.clone();
@@ -855,16 +1096,29 @@ fn show_new_project_wizard(ui: &Rc<Ui>, state: &Rc<RefCell<AppState>>) {
     let folder_create = folder_entry.clone();
     let ui_create = Rc::clone(ui);
     let state_create = Rc::clone(state);
-    create.connect_clicked(move |_| {
-        create_project_from_wizard(
-            &ui_create,
-            &state_create,
-            &dialog_create,
-            &name_create,
-            &choice_create,
-            &folder_create,
-        );
+    let create_trigger = {
+        let ui_create = Rc::clone(&ui_create);
+        let state_create = Rc::clone(&state_create);
+        let dialog_create = dialog_create.clone();
+        let name_create = name_create.clone();
+        let choice_create = choice_create.clone();
+        let folder_create = folder_create.clone();
+        move || {
+            create_project_from_wizard(
+                &ui_create,
+                &state_create,
+                &dialog_create,
+                &name_create,
+                &choice_create,
+                &folder_create,
+            );
+        }
+    };
+    create.connect_clicked({
+        let trigger = create_trigger.clone();
+        move |_| trigger()
     });
+    name_entry.connect_activate(move |_| create_trigger());
 
     dialog.present();
 }
@@ -928,6 +1182,32 @@ fn create_project_from_wizard(
     }
 }
 
+/// Closes the still-empty startup tabs once real files take over.
+///
+/// The window starts with one untitled tab so typing always lands in an
+/// editor; without this, opening a project would leave a dead tab behind.
+fn discard_scratch_tabs(ui: &Rc<Ui>, state: &Rc<RefCell<AppState>>) {
+    let scratch: Vec<usize> = {
+        let app_state = state.borrow();
+        app_state
+            .editors
+            .iter()
+            .enumerate()
+            .filter(|(_, editor)| {
+                editor.path.borrow().as_os_str().is_empty()
+                    && !*editor.modified.borrow()
+                    && editor.text().is_empty()
+            })
+            .map(|(index, _)| index)
+            .collect()
+    };
+    // Highest index first, so the remaining indices stay valid.
+    for index in scratch.into_iter().rev() {
+        state.borrow_mut().editors.remove(index);
+        ui.notebook.remove_page(Some(index as u32));
+    }
+}
+
 /// Opens every source unit of the current project, like Dev-C++ does after
 /// creating a project.
 fn open_project_sources(ui: &Rc<Ui>, state: &Rc<RefCell<AppState>>) {
@@ -942,6 +1222,9 @@ fn open_project_sources(ui: &Rc<Ui>, state: &Rc<RefCell<AppState>>) {
     for path in units {
         open_file(ui, state, &path);
     }
+    // The startup tab exists only to catch typing before a project is open;
+    // real files take its place now.
+    discard_scratch_tabs(ui, state);
 }
 
 fn action_new_file_now(ui: &Rc<Ui>, state: &Rc<RefCell<AppState>>) {
@@ -999,6 +1282,7 @@ fn action_open_now(ui: &Rc<Ui>, state: &Rc<RefCell<AppState>>) {
                                 *state.borrow_mut().index.borrow_mut() = index;
                                 state.borrow_mut().project = Some(project);
                                 panels::set_status(&ui.statusbar, "Project opened");
+                                open_project_sources(&ui, &state);
                             }
                             Err(e) => {
                                 panels::show_error(
@@ -1022,6 +1306,12 @@ fn action_open_now(ui: &Rc<Ui>, state: &Rc<RefCell<AppState>>) {
 fn action_save_now(ui: &Rc<Ui>, state: &Rc<RefCell<AppState>>) {
     {
         if let Some(editor) = current_editor(ui, state) {
+            // An unnamed file (the startup tab, or Ctrl+N) needs a name first:
+            // Dev-C++ prompts instead of failing, and so does devcpp.
+            if editor.path.borrow().as_os_str().is_empty() {
+                action_save_as_now(ui, state);
+                return;
+            }
             if let Err(e) = editor.save() {
                 panels::show_error(&ui.window, "Cannot save", &e.to_string());
             } else {
@@ -1053,7 +1343,7 @@ fn action_save_as_now(ui: &Rc<Ui>, state: &Rc<RefCell<AppState>>) {
         .transient_for(&ui.window)
         .modal(true)
         .build();
-    if let Some(existing) = existing {
+    if let Some(existing) = existing.filter(|p| !p.as_os_str().is_empty()) {
         let _ = dialog.set_file(&gio::File::for_path(&existing));
     }
     let ui = Rc::clone(ui);

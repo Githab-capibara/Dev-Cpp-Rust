@@ -5,7 +5,7 @@
 //! `GtkSourceCompletionWords` only accepts a fixed word list at construction
 //! time while the IDE needs the live project symbol index.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -34,11 +34,27 @@ pub struct Editor {
     completion_list: gtk::ListBox,
     candidates: Rc<RefCell<Vec<CompletionCandidate>>>,
     index: Rc<RefCell<SymbolIndex>>,
+    /// The find/replace bar shown above the view.
+    find_bar: gtk::Box,
+    find_entry: gtk::Entry,
+    find_info: gtk::Label,
+    replace_row: gtk::Box,
+    replace_entry: gtk::Entry,
+    /// Live search context of the buffer (rebuilt when the bar shows).
+    search: RefCell<Option<sourceview::SearchContext>>,
+    /// Text snapshots for undo, oldest first.
+    undo_history: RefCell<Vec<String>>,
+    /// Text snapshots for redo, newest first.
+    redo_history: RefCell<Vec<String>>,
+    /// Baseline text of the last settled edit batch.
+    last_sample: Rc<RefCell<String>>,
+    /// Whether an edit batch is still accumulating changes.
+    batch_open: Rc<Cell<bool>>,
 }
 
 impl Editor {
     /// Creates an editor for `path`, loading the file when it exists.
-    pub fn new(path: &Path, index: Rc<RefCell<SymbolIndex>>) -> Self {
+    pub fn new(path: &Path, index: Rc<RefCell<SymbolIndex>>) -> Rc<Self> {
         let buffer = sourceview::Buffer::new(None);
         let view = sourceview::View::with_buffer(&buffer);
         view.set_show_line_numbers(true);
@@ -53,9 +69,58 @@ impl Editor {
             .vexpand(true)
             .child(&view)
             .build();
+
+        // Find and replace bar, hidden until Find/Replace is invoked.
+        let find_entry = gtk::Entry::builder()
+            .placeholder_text("Find")
+            .hexpand(true)
+            .build();
+        let replace_entry = gtk::Entry::builder()
+            .placeholder_text("Replace with")
+            .hexpand(true)
+            .build();
+        let find_info = gtk::Label::new(None);
+        let prev_button = gtk::Button::with_label("Previous");
+        let next_button = gtk::Button::with_label("Next");
+        let replace_button = gtk::Button::with_label("Replace");
+        let replace_all_button = gtk::Button::with_label("Replace All");
+        let close_button = gtk::Button::with_label("×");
+
+        let find_row = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(6)
+            .margin_top(4)
+            .margin_bottom(4)
+            .margin_start(6)
+            .margin_end(6)
+            .build();
+        find_row.append(&find_entry);
+        find_row.append(&prev_button);
+        find_row.append(&next_button);
+        find_row.append(&find_info);
+        find_row.append(&close_button);
+        let replace_row = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(6)
+            .margin_bottom(4)
+            .margin_start(6)
+            .margin_end(6)
+            .build();
+        replace_row.append(&replace_entry);
+        replace_row.append(&replace_button);
+        replace_row.append(&replace_all_button);
+
+        let find_bar = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .build();
+        find_bar.append(&find_row);
+        find_bar.append(&replace_row);
+        find_bar.set_visible(false);
+
         let widget = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .build();
+        widget.append(&find_bar);
         widget.append(&scroller);
 
         // Completion popup: a popover with a list of candidates.
@@ -72,7 +137,7 @@ impl Editor {
             .has_arrow(false)
             .build();
 
-        let editor = Self {
+        let editor = Rc::new(Self {
             widget,
             view,
             buffer,
@@ -82,9 +147,30 @@ impl Editor {
             completion_list,
             candidates: Rc::new(RefCell::new(Vec::new())),
             index,
-        };
+            find_bar,
+            find_entry,
+            find_info,
+            replace_row,
+            replace_entry,
+            search: RefCell::new(None),
+            undo_history: RefCell::new(Vec::new()),
+            redo_history: RefCell::new(Vec::new()),
+            last_sample: Rc::new(RefCell::new(String::new())),
+            batch_open: Rc::new(Cell::new(false)),
+        });
         editor.load();
+        editor.last_sample.replace(editor.text());
         editor.install_completion();
+        Self::install_find_bar(
+            &editor,
+            &prev_button,
+            &next_button,
+            &replace_button,
+            &replace_all_button,
+            &close_button,
+        );
+        Self::install_undo(&editor);
+        Self::install_change_hub(&editor);
         editor
     }
 
@@ -186,6 +272,169 @@ impl Editor {
         refill_completion_list(&self.completion_list, candidates);
     }
 
+    /// Pushes `text` onto the undo stack unless it duplicates the newest
+    /// snapshot. Capped so a long session cannot grow without bound.
+    fn push_undo_snapshot(&self, text: &str) {
+        let mut history = self.undo_history.borrow_mut();
+        if history.last().is_some_and(|last| last == text) {
+            return;
+        }
+        history.push(text.to_string());
+        if history.len() > UNDO_LIMIT {
+            history.remove(0);
+        }
+    }
+
+    /// Records the current text as a snapshot for later undo. Called by
+    /// clipboard actions that bypass the ordinary keystroke path.
+    pub fn snapshot_undo(&self) {
+        let text = self.text();
+        let mut history = self.undo_history.borrow_mut();
+        if history.last().is_none_or(|last| *last != text) {
+            history.push(text);
+            if history.len() > UNDO_LIMIT {
+                history.remove(0);
+            }
+        }
+    }
+
+    /// Restores the state before the last edit batch, if any.
+    pub fn undo(&self) {
+        let Some(previous) = self.undo_history.borrow_mut().pop() else {
+            return;
+        };
+        let current = self.text();
+        if current == previous {
+            return;
+        }
+        self.batch_open.set(false);
+        let mut redo = self.redo_history.borrow_mut();
+        redo.push(current);
+        if redo.len() > UNDO_LIMIT {
+            redo.remove(0);
+        }
+        drop(redo);
+        self.replace_text(&previous);
+        self.last_sample.replace(previous);
+    }
+
+    /// Re-applies the state undone by [`Self::undo`].
+    pub fn redo(&self) {
+        let Some(next) = self.redo_history.borrow_mut().pop() else {
+            return;
+        };
+        let current = self.text();
+        if current == next {
+            return;
+        }
+        self.batch_open.set(false);
+        let mut history = self.undo_history.borrow_mut();
+        history.push(current);
+        if history.len() > UNDO_LIMIT {
+            history.remove(0);
+        }
+        drop(history);
+        self.replace_text(&next);
+        self.last_sample.replace(next);
+    }
+
+    /// Replaces the whole buffer content with `text`.
+    fn replace_text(&self, text: &str) {
+        let mut start = self.buffer.start_iter();
+        let mut end = self.buffer.end_iter();
+        self.buffer.delete(&mut start, &mut end);
+        let mut cursor = self.buffer.start_iter();
+        self.buffer.insert(&mut cursor, text);
+        self.modified.replace(true);
+    }
+
+    /// Ctrl+Z / Ctrl+Y (and Shift+Ctrl+Z): undo/redo dispatch.
+    ///
+    /// Snapshots come from [`Self::install_change_hub`] on real buffer
+    /// changes, because on Wayland typed characters often arrive as text
+    /// commits, and a key controller alone would miss every insertion.
+    pub fn install_undo(me: &Rc<Self>) {
+        let keys = gtk::EventControllerKey::new();
+        let editor = Rc::clone(me);
+        keys.connect_key_pressed(move |_, keyval, _, modifiers| {
+            if !modifiers.contains(gdk::ModifierType::CONTROL_MASK) {
+                return glib::Propagation::Proceed;
+            }
+            if keyval == gdk::Key::z && !modifiers.contains(gdk::ModifierType::SHIFT_MASK) {
+                editor.undo();
+                glib::Propagation::Stop
+            } else if keyval == gdk::Key::y
+                || (keyval == gdk::Key::z && modifiers.contains(gdk::ModifierType::SHIFT_MASK))
+            {
+                editor.redo();
+                glib::Propagation::Stop
+            } else {
+                glib::Propagation::Proceed
+            }
+        });
+        me.view.add_controller(keys);
+    }
+
+    /// One observer for every buffer mutation.
+    ///
+    /// It does two jobs: feeds auto-completion after `.`/`->` and drives the
+    /// undo batch sampler. Buffer changes are the ground truth for text
+    /// edits, unlike keystrokes, which some input stacks deliver as commits.
+    fn install_change_hub(me: &Rc<Self>) {
+        // --- completion auto-popup --------------------------------------
+        let view = me.view.clone();
+        let popover = me.completion.clone();
+        let list = me.completion_list.clone();
+        let candidates = Rc::clone(&me.candidates);
+        let index = Rc::clone(&me.index);
+        me.buffer.connect_changed(move |_| {
+            let view = view.clone();
+            let popover = popover.clone();
+            let list = list.clone();
+            let candidates = Rc::clone(&candidates);
+            let index = Rc::clone(&index);
+            glib::idle_add_local_once(move || {
+                if !cursor_follows_member_access(&view) {
+                    return;
+                }
+                let Some(buffer) = view.buffer().downcast::<sourceview::Buffer>().ok() else {
+                    return;
+                };
+                let found = completion_candidates(&buffer, &index);
+                if found.is_empty() {
+                    popover.popdown();
+                    return;
+                }
+                refill_completion_list(&list, &found);
+                candidates.replace(found);
+                popup_completion(&view, &popover);
+            });
+        });
+
+        // --- undo batching ----------------------------------------------
+        // A batch starts at the first change after the previous one settled
+        // (500 ms of quiet) and stores the state from before the batch.
+        let last_sample = Rc::clone(&me.last_sample);
+        let batch_open = Rc::clone(&me.batch_open);
+        let editor_for_batch = Rc::clone(me);
+        let buffer_for_batch = me.buffer.clone();
+        me.buffer.connect_changed(move |_| {
+            editor_for_batch.modified.replace(true);
+            if !batch_open.get() {
+                let previous = last_sample.borrow().clone();
+                editor_for_batch.push_undo_snapshot(&previous);
+                batch_open.set(true);
+                let sample = Rc::clone(&last_sample);
+                let open = Rc::clone(&batch_open);
+                let buffer = buffer_for_batch.clone();
+                glib::timeout_add_local_once(std::time::Duration::from_millis(500), move || {
+                    sample.replace(buffer_text(&buffer));
+                    open.set(false);
+                });
+            }
+        });
+    }
+
     fn install_completion(&self) {
         let list = self.completion_list.clone();
         let candidates = Rc::clone(&self.candidates);
@@ -227,41 +476,234 @@ impl Editor {
             }
         });
         self.completion.add_controller(key);
+    }
 
-        // Auto-popup after "." or "->", like Dev-C++'s member completion.
-        let popup_view = self.view.clone();
-        let popup_popover = self.completion.clone();
-        let popup_list = self.completion_list.clone();
-        let popup_candidates = Rc::clone(&self.candidates);
-        let popup_index = Rc::clone(&self.index);
-        let typed = gtk::EventControllerKey::new();
-        typed.connect_key_released(move |_, _, _, _| {
-            if !cursor_follows_member_access(&popup_view) {
+    /// Shows the find bar; `with_replace` also reveals the replace row.
+    pub fn show_find(&self, with_replace: bool) {
+        self.find_bar.set_visible(true);
+        self.replace_row.set_visible(with_replace);
+        *self.search.borrow_mut() = None;
+        self.find_entry.grab_focus();
+    }
+
+    /// Hides the find bar and drops the live search context.
+    pub fn hide_find(&self) {
+        self.find_bar.set_visible(false);
+        self.take_search();
+    }
+
+    /// Whether the find bar is currently shown.
+    #[must_use]
+    pub fn find_bar_visible(&self) -> bool {
+        self.find_bar.is_visible()
+    }
+
+    /// The text to look for, or `None` while the entry is empty.
+    fn find_text(&self) -> Option<String> {
+        let text = self.find_entry.text().to_string();
+        (!text.is_empty()).then_some(text)
+    }
+
+    /// Selects the next match after the cursor.
+    pub fn find_next(&self) {
+        if self.find_text().is_none() {
+            self.find_info.set_text("Find: empty");
+            return;
+        }
+        let search = self.ensure_search();
+        let Some((start, end, _)) = search
+            .as_ref()
+            .and_then(|s| s.forward(&self.buffer.iter_at_mark(&self.buffer.get_insert())))
+        else {
+            self.find_info.set_text("No matches");
+            return;
+        };
+        self.select_match(&start, &end);
+    }
+
+    /// Selects the previous match before the cursor.
+    pub fn find_prev(&self) {
+        if self.find_text().is_none() {
+            self.find_info.set_text("Find: empty");
+            return;
+        }
+        let search = self.ensure_search();
+        let Some((start, end, _)) = search
+            .as_ref()
+            .and_then(|s| s.backward(&self.buffer.iter_at_mark(&self.buffer.get_insert())))
+        else {
+            self.find_info.set_text("No matches");
+            return;
+        };
+        self.select_match(&start, &end);
+    }
+
+    /// Replaces the selected match, if the selection is a match.
+    pub fn replace_current(&self) {
+        let search = self.ensure_search();
+        let Some(search) = search.as_ref() else {
+            return;
+        };
+        let Some((mut start, mut end)) = self.buffer.selection_bounds() else {
+            return;
+        };
+        if start == end {
+            return;
+        }
+        let replacement = self.replace_entry.text().to_string();
+        if search.replace(&mut start, &mut end, &replacement).is_err() {
+            self.find_info.set_text("Replace failed");
+            return;
+        }
+        self.find_next();
+    }
+
+    /// Replaces every match in the buffer, reporting the count.
+    pub fn replace_all(&self) {
+        if self.find_text().is_none() {
+            self.find_info.set_text("Find: empty");
+            return;
+        }
+        let search = self.ensure_search();
+        let Some(search) = search.as_ref() else {
+            return;
+        };
+        let replacement = self.replace_entry.text().to_string();
+        let mut count = 0usize;
+        let mut cursor = self.buffer.start_iter();
+        while let Some((mut start, mut end, _)) = search.forward(&cursor) {
+            if search.replace(&mut start, &mut end, &replacement).is_err() {
+                self.find_info.set_text("Replace failed");
                 return;
             }
-            let view = popup_view.clone();
-            let popover = popup_popover.clone();
-            let list = popup_list.clone();
-            let candidates = Rc::clone(&popup_candidates);
-            let index = Rc::clone(&popup_index);
-            glib::idle_add_local_once(move || {
-                if !cursor_follows_member_access(&view) {
-                    return;
+            count += 1;
+            cursor = self
+                .buffer
+                .iter_at_offset(start.offset() + replacement.chars().count() as i32);
+        }
+        self.find_info
+            .set_text(&format!("Replaced {count} match(es)"));
+    }
+
+    /// Selects and scrolls to a match.
+    fn select_match(&self, start: &gtk::TextIter, end: &gtk::TextIter) {
+        self.buffer.select_range(start, end);
+        let mut scroll_target = *start;
+        self.view
+            .scroll_to_iter(&mut scroll_target, 0.25, false, 0.0, 0.0);
+        let line = start.line() + 1;
+        self.find_info.set_text(&format!("Line {line}"));
+    }
+
+    /// Creates (once) the search context mirroring the find entry text.
+    fn ensure_search(&self) -> std::cell::RefMut<'_, Option<sourceview::SearchContext>> {
+        if self.search.borrow().is_none() {
+            let settings = sourceview::SearchSettings::builder()
+                .search_text(self.find_entry.text().to_string())
+                .case_sensitive(false)
+                .wrap_around(true)
+                .regex_enabled(false)
+                .build();
+            let context = sourceview::SearchContext::new(&self.buffer, Some(&settings));
+            context.set_highlight(true);
+            *self.search.borrow_mut() = Some(context);
+        }
+        self.search.borrow_mut()
+    }
+
+    /// Drops the search context (highlight disappears).
+    fn take_search(&self) {
+        *self.search.borrow_mut() = None;
+    }
+
+    /// Wires the find bar buttons and its keyboard behaviour. Called with the
+    /// editor's own `Rc`, so the callbacks can call editor methods.
+    pub fn install_find_bar(
+        me: &Rc<Self>,
+        prev: &gtk::Button,
+        next: &gtk::Button,
+        replace: &gtk::Button,
+        replace_all: &gtk::Button,
+        close: &gtk::Button,
+    ) {
+        // Escape in either entry closes the bar. Each entry needs its own
+        // controller: a glib clone shares the underlying object and GTK
+        // rejects adding one controller to two widgets.
+        let weak_bar = me.find_bar.downgrade();
+        let escape_bar = weak_bar.clone();
+        let escape = gtk::EventControllerKey::new();
+        escape.connect_key_pressed(move |_, keyval, _, _| {
+            if keyval == gdk::Key::Escape {
+                if let Some(bar) = escape_bar.upgrade() {
+                    bar.set_visible(false);
                 }
-                let Some(buffer) = view.buffer().downcast::<sourceview::Buffer>().ok() else {
-                    return;
-                };
-                let found = completion_candidates(&buffer, &index);
-                if found.is_empty() {
-                    popover.popdown();
-                    return;
-                }
-                refill_completion_list(&list, &found);
-                candidates.replace(found);
-                popup_completion(&view, &popover);
-            });
+                gtk::glib::Propagation::Stop
+            } else {
+                gtk::glib::Propagation::Proceed
+            }
         });
-        self.view.add_controller(typed);
+        me.find_entry.add_controller(escape);
+        let escape_bar = weak_bar;
+        let escape = gtk::EventControllerKey::new();
+        escape.connect_key_pressed(move |_, keyval, _, _| {
+            if keyval == gdk::Key::Escape {
+                if let Some(bar) = escape_bar.upgrade() {
+                    bar.set_visible(false);
+                }
+                gtk::glib::Propagation::Stop
+            } else {
+                gtk::glib::Propagation::Proceed
+            }
+        });
+        me.replace_entry.add_controller(escape);
+
+        // Buttons stay out of the tab chain so Tab moves entry -> entry.
+        prev.set_focusable(false);
+        next.set_focusable(false);
+        close.set_focusable(false);
+        replace.set_focusable(false);
+        replace_all.set_focusable(false);
+
+        // Shift+Enter in the find entry jumps to the previous match.
+        let shift_prev = Rc::clone(me);
+        let shift_keys = gtk::EventControllerKey::new();
+        shift_keys.connect_key_pressed(move |_, keyval, _, modifiers| {
+            if keyval == gdk::Key::Return && modifiers.contains(gdk::ModifierType::SHIFT_MASK) {
+                shift_prev.find_prev();
+                gtk::glib::Propagation::Stop
+            } else {
+                gtk::glib::Propagation::Proceed
+            }
+        });
+        me.find_entry.add_controller(shift_keys);
+
+        // Enter in the find entry jumps to the next match; in the replace
+        // entry it replaces the current one, like Dev-C++.
+        let enter_next = Rc::clone(me);
+        me.find_entry
+            .connect_activate(move |_| enter_next.find_next());
+        let enter_replace = Rc::clone(me);
+        me.replace_entry
+            .connect_activate(move |_| enter_replace.replace_current());
+
+        // Editing the search text invalidates the live context.
+        let invalidate = Rc::clone(me);
+        me.find_entry.connect_changed(move |_| {
+            if invalidate.search.borrow().is_some() {
+                invalidate.search.borrow_mut().take();
+            }
+        });
+
+        let prev_editor = Rc::clone(me);
+        prev.connect_clicked(move |_| prev_editor.find_prev());
+        let next_editor = Rc::clone(me);
+        next.connect_clicked(move |_| next_editor.find_next());
+        let replace_editor = Rc::clone(me);
+        replace.connect_clicked(move |_| replace_editor.replace_current());
+        let all_editor = Rc::clone(me);
+        replace_all.connect_clicked(move |_| all_editor.replace_all());
+        let bar = me.find_bar.clone();
+        close.connect_clicked(move |_| bar.set_visible(false));
     }
 
     /// Applies the configured font.
@@ -354,4 +796,14 @@ fn insert_completion_in_buffer(buffer: &sourceview::Buffer, name: &str) {
     buffer.delete(&mut start, &mut end);
     let mut cursor = buffer.iter_at_mark(&buffer.get_insert());
     buffer.insert(&mut cursor, name);
+}
+
+/// Maximum undo snapshots kept per editor.
+const UNDO_LIMIT: usize = 512;
+
+/// The full text of `buffer`.
+fn buffer_text(buffer: &sourceview::Buffer) -> String {
+    buffer
+        .text(&buffer.start_iter(), &buffer.end_iter(), false)
+        .to_string()
 }
