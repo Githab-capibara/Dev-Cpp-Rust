@@ -1,5 +1,5 @@
 [package]
-repository = "https://github.com/Githab-capibara/Dev-Cpp-Rust"
+repository.workspace = true
 keywords = ["ide", "c", "cpp", "gtk4", "dev-cpp"]
 categories = ["development-tools"]
 name = "devcpp-cli"

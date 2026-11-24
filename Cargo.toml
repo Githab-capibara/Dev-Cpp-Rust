@@ -8,6 +8,7 @@ edition = "2021"
 rust-version = "1.88"
 authors = ["Dev-C++ Rust Contributors"]
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/Githab-capibara/Dev-Cpp-Rust"
 
 [workspace.lints.rust]
 unsafe_code = "warn"

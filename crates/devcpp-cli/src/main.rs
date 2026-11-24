@@ -50,6 +50,17 @@ enum Command {
         /// Project file (.dev).
         project: PathBuf,
     },
+    /// Create a new project from a template.
+    New {
+        /// Project name (becomes `name.dev`).
+        name: String,
+        /// Template name (see `devcpp templates`).
+        #[arg(long, default_value = "Console Application")]
+        template: String,
+        /// Target directory for the project.
+        #[arg(long, default_value = ".")]
+        dir: PathBuf,
+    },
     /// List the tools available on this machine.
     Tools,
     /// List the project templates.
@@ -127,6 +138,18 @@ fn run(cli: Cli) -> Result<ExitCode> {
             }
             Ok(ExitCode::SUCCESS)
         }
+        Command::New {
+            name,
+            template,
+            dir,
+        } => {
+            let Some(template) = devcpp_core::templates::find_by_name(&template) else {
+                anyhow::bail!("unknown template: {template} (see: devcpp templates)")
+            };
+            let dev_path = devcpp_core::templates::create(template, &name, &dir)?;
+            println!("{}", dev_path.display());
+            Ok(ExitCode::SUCCESS)
+        }
         Command::Tools => {
             let tc = Toolchain::detect();
             println!("C compiler:     {:?}", tc.c_compiler.path);
@@ -156,12 +179,11 @@ fn build_and_wait(project: &Project, mode: RunMode) -> Result<ExitCode> {
     let success;
     loop {
         match job.recv() {
+            // Diagnostics are not printed separately: the raw compiler line
+            // already carries file, line and message, and printing both
+            // duplicated every error in the log.
             Ok(BuildMessage::Line(line)) => println!("{line}"),
-            Ok(BuildMessage::Diagnostic(diag)) => {
-                if let Some(loc) = diag.location() {
-                    println!("{loc}: {}: {}", diag.severity, diag.message);
-                }
-            }
+            Ok(BuildMessage::Diagnostic(_)) => {}
             Ok(BuildMessage::Error(e)) => eprintln!("devcpp: {e}"),
             Ok(BuildMessage::Finished(ok)) => {
                 success = ok;
